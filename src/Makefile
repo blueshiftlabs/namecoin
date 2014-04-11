@@ -9,27 +9,21 @@ MINGW=$(shell uname -s|grep -i mingw32)
 DEFS += -DBOOST_THREAD_USE_LIB
 
 INCLUDEPATHS= \
-	-I../libs/openssl-1.0.1e/include \
-	-I../libs/db-4.7.25.NC/build_unix \
-	-I../libs/boost_1_50_0
-
-LIBPATHS= \
-	-L../libs/openssl-1.0.1e \
-	-L../libs/db-4.7.25.NC/build_unix \
-	-L../libs/boost_1_50_0/stage/lib
+   -I/usr/include/libdb4
 
 LIBBOOST_SUFFIX=
 
 LIBS= \
- -Wl,-Bstatic \
    -l boost_system$(LIBBOOST_SUFFIX) \
    -l boost_filesystem$(LIBBOOST_SUFFIX) \
    -l boost_program_options$(LIBBOOST_SUFFIX) \
    -l boost_thread$(LIBBOOST_SUFFIX) \
    -l boost_chrono$(LIBBOOST_SUFFIX) \
-   -l db_cxx \
+   -l db_cxx-4.8 \
    -l ssl \
-   -l crypto
+   -l crypto \
+   -l krb5 \
+   -l opendkim
 
 namecoin: USE_UPNP:=1
 	ifdef USE_UPNP
@@ -70,7 +64,7 @@ namecoind: USE_UPNP:=0
 			-l pthread
 	endif
 
-CXXFLAGS=-O2 -Wno-invalid-offsetof -Wformat $(DEFS) $(INCLUDEPATHS)
+CXXFLAGS=-O2 -g -Wno-invalid-offsetof -Wformat $(DEFS) $(INCLUDEPATHS)
 HEADERS=headers.h strlcpy.h serialize.h uint256.h util.h key.h bignum.h base58.h \
     script.h allocators.h db.h walletdb.h crypter.h net.h irc.h keystore.h main.h wallet.h bitcoinrpc.h uibase.h ui.h noui.h init.h auxpow.h
 
