@@ -62,8 +62,11 @@ private:
 class dkim_context {
 public:
     dkim_context() : m_ctx(NULL) { }
-    dkim_context(DKIM *ctx) : m_ctx(ctx) { }
     ~dkim_context();
+
+    void set_context(DKIM *ctx) {
+        m_ctx = ctx;
+    }
     
     dkim_stat chunk(const unsigned char *data, size_t len);
     dkim_stat eom(bool *testkey = NULL);

@@ -1069,34 +1069,39 @@ Value get_email_proof_body(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() != 1)
         throw runtime_error(
-            "get_email_proof_body <email>\n"
+            "get_email_proof_body <email>|<txid>\n"
             "Get the body for a DKIM-signed proof email.");
 
     CNameDB dbName("r");
-    vector<unsigned char> vchName = vchFromString("e/" + params[0].get_str());
+    string strName = params[0].get_str();
+    vector<unsigned char> vchName = vchFromString("e/" + strName);
     CTransaction tx;
     uint256 txHash;
 
-    if (!GetTxOfName(dbName, vchName, tx))
+    if (GetTxOfName(dbName, vchName, tx))
     {
-        // OK, maybe this is NAME_NEW, and it's in the map.
-        if (!mapMyNames.count(vchName))
-        {
-            throw runtime_error("could not find coin with this name");
-        }
-        
+        txHash = tx.GetHash();
+    }
+    // OK, maybe this is NAME_NEW, and it's in the map.
+    else if (mapMyNames.count(vchName))
+    {
         txHash = mapMyNames[vchName];
+    }
+    // OK, were we given a tx hash as an argument?
+    else if (strName.size() == 64)
+    {
+        txHash.SetHex(strName);
     }
     else
     {
-        txHash = tx.GetHash();
+        throw runtime_error("could not find coin with this name");
     }
 
     string base64 = EncodeBase64(txHash.begin(), txHash.size());
 
     vector<Pair> result;
     result.push_back(Pair("prev", base64));
-    return result;
+    return string("mailto:v1@authenticoin.bit?body=") + write_string(Value(result), false);
 }
 
 Value name_firstupdate(const Array& params, bool fHelp)
@@ -1239,6 +1244,8 @@ Value name_firstupdate(const Array& params, bool fHelp)
                 throw runtime_error("could not create proof script");
             
             vecSend.push_back(make_pair(scriptProof, MIN_AMOUNT));
+
+            return "test success";
         }
         
         string strError = SendMoneyWithInputTx(vecSend, nNetFee, wtxIn, wtx, false);
@@ -1280,9 +1287,9 @@ Value name_update(const Array& params, bool fHelp)
     wtx.nVersion = NAMECOIN_TX_VERSION;
     CScript scriptPubKeyOrig;
 
-    if (params.size() == 3)
+    if (params.size() == (isEmail ? 4 : 3))
     {
-        string strAddress = params[2].get_str();
+        string strAddress = params[params.size()-1].get_str();
         uint160 hash160;
         bool isValid = AddressToHash160(strAddress, hash160);
         if (!isValid)
@@ -1881,12 +1888,12 @@ bool WriteSplitData(CScript& script, const vector<unsigned char> &vch)
     unsigned int bytes_remaining = vch.size();
 
     while (bytes_remaining) {
-        vector<unsigned char>::const_iterator vchIterNext = vchIter + min(bytes_remaining, SPLIT_DATA_SIZE);
-        vchData.assign(vchIter, vchIterNext);
+        unsigned int bytesToCopy = min(bytes_remaining, SPLIT_DATA_SIZE);
+        vchData.assign(vchIter, vchIter + bytesToCopy);
         script << vchData;
         
-        vchIter = vchIterNext;
-        bytes_remaining -= (vchIterNext - vchIter);
+        vchIter += bytesToCopy;
+        bytes_remaining -= bytesToCopy;
     }
 
     return true;
@@ -2476,7 +2483,7 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
         return error("ConnectInputsHook(): mismatch bug workaround - should not mine this tx");
 
     // TODO: Limit DKIM proof work from non-miners, and after a given number of confirmations.
-    if (needsEmailProof)
+    if (needsEmailProof && pindexBlock->nHeight > 35450)
     {
         vector<unsigned char> vchPrevTx;
         if (proofOp == OP_PROOF_EMAIL)
@@ -2495,7 +2502,7 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
         }
         else
         {
-            return error("Invalid proof type for e/ namespace");
+            return error("Invalid proof type for e/ namespace (height %u)", pindexBlock->nHeight);
         }
 
         if (vTxPrev[nInput].GetHash() != uint256(vchPrevTx))
@@ -2846,7 +2853,7 @@ bool ValidateDKIMMessage(const vector<unsigned char> &vchMessage,
         return error("DKIM message signed by '%s' instead of '%s'",
                 signingDomain.c_str(), domain.c_str());
 
-    if (signingUser != "" && signingUser != user)
+    if (signing_identity[0] != '@' && signingUser != user)
         return error("DKIM message signed to user '%s' instead of '%s'",
                 signingUser.c_str(), user.c_str());
 

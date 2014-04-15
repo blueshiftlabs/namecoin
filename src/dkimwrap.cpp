@@ -2,6 +2,7 @@
 #include <opendkim/dkim.h>
 #include <vector>
 #include <string>
+#include <cstring>
 
 using namespace std;
 
@@ -44,11 +45,13 @@ const char *dkim_stat::message() const {
 
 dkim_stat dkim_siginfo::get_identity(std::vector<unsigned char> &identity) {
 	identity.clear();
+
 	dkim_stat stat;
 	do {
-		identity.reserve(identity.capacity() + 128);
-		stat = dkim_sig_getidentity(m_ctx, m_sig, &identity.front(), identity.capacity());
+		identity.resize(identity.size() + 128);
+		stat = dkim_sig_getidentity(m_ctx, m_sig, &identity[0], identity.size());
 	} while (stat == DKIM_STAT_NORESOURCE);
+	identity.resize(strlen((char*)&identity[0]));
 
 	return stat;
 }
@@ -123,7 +126,7 @@ dkim_stat dkim_lib::verify(const char *id, dkim_context &ctx) {
 	DKIM_STAT stat;
 	DKIM *dkim = dkim_verify(m_lib, (const unsigned char *)id, NULL, &stat);
 	if (dkim) {
-		ctx = dkim;
+		ctx.set_context(dkim);
 		return dkim_stat();
 	} else {
 		return stat;
@@ -131,9 +134,11 @@ dkim_stat dkim_lib::verify(const char *id, dkim_context &ctx) {
 }
 
 bool parse_email_addr(const vector<unsigned char> &email, string &user, string &domain) {
-	vector<unsigned char> email_copy = email;
+	vector<unsigned char> email_copy(email);
+	email_copy.push_back('\0');
+	unsigned char *buf = &email_copy[0];
 	unsigned char *user_p, *domain_p;
-	if (dkim_mail_parse(&email_copy.front(), &user_p, &domain_p)) {
+	if (dkim_mail_parse(buf, &user_p, &domain_p)) {
 		return false;
 	}
 
