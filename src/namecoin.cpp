@@ -9,6 +9,7 @@
 #include "init.h"
 #include "auxpow.h"
 #include "namecoin.h"
+#include "dkimwrap.h"
 
 #include "bitcoinrpc.h"
 
@@ -16,6 +17,9 @@
 #include "json/json_spirit_writer_template.h"
 #include "json/json_spirit_utils.h"
 #include <boost/xpressive/xpressive_dynamic.hpp>
+#include <boost/xpressive/xpressive_static.hpp>
+#include <boost/algorithm/string.hpp>
+#include <fstream>
 
 using namespace std;
 using namespace json_spirit;
@@ -41,11 +45,19 @@ extern uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsig
 
 // forward decls
 extern bool DecodeNameScript(const CScript& script, int& op, vector<vector<unsigned char> > &vvch, CScript::const_iterator& pc);
+extern bool DecodeProofScript(const CScript& script, int& op, vector<vector<unsigned char> > &vvch);
 extern bool Solver(const CKeyStore& keystore, const CScript& scriptPubKey, uint256 hash, int nHashType, CScript& scriptSigRet);
 extern bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CTransaction& txTo, unsigned int nIn, int nHashType);
 extern bool IsConflictedTx(CTxDB& txdb, const CTransaction& tx, vector<unsigned char>& name);
 extern void rescanfornames();
 extern Value sendtoaddress(const Array& params, bool fHelp);
+
+extern bool ReadSplitData(const CScript& script, vector<unsigned char> &vch, CScript::const_iterator &pc);
+extern bool WriteSplitData(CScript& script, vector<unsigned char> &vch);
+extern bool DecodeEmailNamespace(const vector<unsigned char> &vchName, vector<unsigned char> *email);
+extern bool ValidateDKIMMessage(const vector<unsigned char> &vchMessage, const vector<unsigned char> &email, vector<unsigned char> &prevTxHash);
+
+extern bool CreateEmailProofScript(const vector<unsigned char> &vchMessage, const vector<unsigned char> &email, const uint256 &prevTxHash, CScript &scriptPubKey);
 
 const int NAME_COIN_GENESIS_EXTRA = 521;
 uint256 hashNameCoinGenesisBlock("000000000062b72c5e2ceb45fbc8587e807c155b0da735e6483dfba2f0a9c770");
@@ -412,19 +424,23 @@ bool CreateTransactionWithInputTx(const vector<pair<CScript, int64> >& vecSend, 
 
 // nTxOut is the output from wtxIn that we should grab
 // requires cs_main lock
-string SendMoneyWithInputTx(CScript scriptPubKey, int64 nValue, int64 nNetFee, CWalletTx& wtxIn, CWalletTx& wtxNew, bool fAskFee)
+string SendMoneyWithInputTx(vector< pair<CScript, int64> > &vecSend, int64 nNetFee, CWalletTx& wtxIn, CWalletTx& wtxNew, bool fAskFee)
 {
     int nTxOut = IndexOfNameOutput(wtxIn);
     CReserveKey reservekey(pwalletMain);
     int64 nFeeRequired;
-    vector< pair<CScript, int64> > vecSend;
-    vecSend.push_back(make_pair(scriptPubKey, nValue));
 
     if (nNetFee)
     {
         CScript scriptFee;
         scriptFee << OP_RETURN;
         vecSend.push_back(make_pair(scriptFee, nNetFee));
+    }
+
+    int64 nValue = 0;
+    BOOST_FOREACH( PAIRTYPE(CScript, int64)& p, vecSend )
+    {
+        nValue += p.second;
     }
 
     if (!CreateTransactionWithInputTx(vecSend, wtxIn, nTxOut, wtxNew, reservekey, nFeeRequired))
@@ -450,6 +466,14 @@ string SendMoneyWithInputTx(CScript scriptPubKey, int64 nValue, int64 nNetFee, C
         return _("Error: The transaction was rejected.  This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.");
 
     return "";
+}
+
+string SendMoneyWithInputTx(CScript scriptPubKey, int64 nAmount, int64 nNetFee, CWalletTx& wtxIn, CWalletTx& wtxNew, bool fAskFee)
+{
+    vector< pair<CScript, int64> > vecSend;
+    vecSend.push_back(make_pair(scriptPubKey, nAmount));
+
+    return SendMoneyWithInputTx(vecSend, nNetFee, wtxIn, wtxNew, fAskFee);
 }
 
 bool GetValueOfTxPos(const CNameIndex& txPos, vector<unsigned char>& vchValue, uint256& hash, int& nHeight)
@@ -919,7 +943,7 @@ Value name_filter(const Array& params, bool fHelp)
         Object oName;
         if (!fStat) {
             oName.push_back(Pair("name", name));
-	        int nExpiresIn = nHeight + GetDisplayExpirationDepth(nHeight) - pindexBest->nHeight;
+            int nExpiresIn = nHeight + GetDisplayExpirationDepth(nHeight) - pindexBest->nHeight;
             if (nExpiresIn <= 0)
             {
                 oName.push_back(Pair("expired", 1));
@@ -1026,25 +1050,93 @@ Value name_scan(const Array& params, bool fHelp)
     return oRes;
 }
 
+vector<unsigned char> readfile(const string &filename)
+{
+    vector<unsigned char> rv;
+    ifstream file(filename.c_str());
+    if (!file)
+        throw runtime_error("Could not open proof file");
+
+    file.seekg(0, ios::end);
+    rv.resize(file.tellg());
+    file.seekg(0, ios::beg);
+    file.read((char *)&rv[0], rv.size());
+
+    return rv;
+}
+
+Value get_email_proof_body(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "get_email_proof_body <email>\n"
+            "Get the body for a DKIM-signed proof email.");
+
+    CNameDB dbName("r");
+    vector<unsigned char> vchName = vchFromString("e/" + params[0].get_str());
+    CTransaction tx;
+    uint256 txHash;
+
+    if (!GetTxOfName(dbName, vchName, tx))
+    {
+        // OK, maybe this is NAME_NEW, and it's in the map.
+        if (!mapMyNames.count(vchName))
+        {
+            throw runtime_error("could not find coin with this name");
+        }
+        
+        txHash = mapMyNames[vchName];
+    }
+    else
+    {
+        txHash = tx.GetHash();
+    }
+
+    string base64 = EncodeBase64(txHash.begin(), txHash.size());
+
+    vector<Pair> result;
+    result.push_back(Pair("prev", base64));
+    return result;
+}
+
 Value name_firstupdate(const Array& params, bool fHelp)
 {
-    if (fHelp || params.size() < 3 || params.size() > 4)
+    bool isEmail = false;
+    vector<unsigned char> vchName;
+    vector<unsigned char> vchEmail;
+    
+    if (params.size() > 1)
+    {
+        vchName = vchFromValue(params[0]);
+        isEmail = DecodeEmailNamespace(vchName, &vchEmail);
+    }
+        
+    if (fHelp || params.size() < (isEmail ? 4 : 3) || params.size() > (isEmail ? 5 : 4))
         throw runtime_error(
                 "name_firstupdate <name> <rand> [<tx>] <value>\n"
+                "name_firstupdate e/<email> <rand> [<tx>] <value> <proof>\n"
                 "Perform a first update after a name_new reservation.\n"
                 "Note that the first update will go into a block 12 blocks after the name_new, at the soonest."
                 + HelpRequiringPassphrase());
-    vector<unsigned char> vchName = vchFromValue(params[0]);
+    
     vector<unsigned char> vchRand = ParseHex(params[1].get_str());
     vector<unsigned char> vchValue;
+    string strProofPath;
+    vector<unsigned char> vchProof;
 
-    if (params.size() == 3)
+    if (params.size() == (isEmail ? 4 : 3))
     {
         vchValue = vchFromValue(params[2]);
     }
     else
     {
         vchValue = vchFromValue(params[3]);
+    }
+
+    if (isEmail)
+    {
+        strProofPath = params[params.size()-1].get_str();
+        vchProof = readfile(strProofPath);
     }
 
     CWalletTx wtx;
@@ -1136,7 +1228,21 @@ Value name_firstupdate(const Array& params, bool fHelp)
         // Round up to CENT
         nNetFee += CENT - 1;
         nNetFee = (nNetFee / CENT) * CENT;
-        string strError = SendMoneyWithInputTx(scriptPubKey, MIN_AMOUNT, nNetFee, wtxIn, wtx, false);
+
+        vector<pair<CScript, int64> > vecSend;
+        vecSend.push_back(make_pair(scriptPubKey, MIN_AMOUNT));
+
+        if (isEmail)
+        {
+            CScript scriptProof;
+            if (!CreateEmailProofScript(vchProof, vchEmail, wtxInHash, scriptProof))
+                throw runtime_error("could not create proof script");
+            
+            vecSend.push_back(make_pair(scriptProof, MIN_AMOUNT));
+        }
+        
+        string strError = SendMoneyWithInputTx(vecSend, nNetFee, wtxIn, wtx, false);
+        
         if (strError != "")
             throw JSONRPCError(RPC_WALLET_ERROR, strError);
     }
@@ -1145,13 +1251,30 @@ Value name_firstupdate(const Array& params, bool fHelp)
 
 Value name_update(const Array& params, bool fHelp)
 {
-    if (fHelp || params.size() < 2 || params.size() > 3)
+    bool isEmail = false;
+    vector<unsigned char> vchName;
+    vector<unsigned char> vchEmail;
+    
+    if (params.size() > 1)
+    {
+        vchName = vchFromValue(params[0]);
+        isEmail = DecodeEmailNamespace(vchName, &vchEmail);
+    }
+        
+    if (fHelp || params.size() < (isEmail ? 3 : 2) || params.size() > (isEmail ? 4 : 3))
         throw runtime_error(
-                "name_update <name> <value> [<toaddress>]\nUpdate and possibly transfer a name"
+                "name_update <name> <value> [<toaddress>]\n"
+                "name_update e/<email> <value> <proof> [<toaddress>]\n"
+                "Update and possibly transfer a name"
                 + HelpRequiringPassphrase());
 
-    vector<unsigned char> vchName = vchFromValue(params[0]);
     vector<unsigned char> vchValue = vchFromValue(params[1]);
+    vector<unsigned char> vchProof;
+
+    if (isEmail)
+    {
+        vchProof = readfile(params[2].get_str());
+    }
 
     CWalletTx wtx;
     wtx.nVersion = NAMECOIN_TX_VERSION;
@@ -1206,7 +1329,20 @@ Value name_update(const Array& params, bool fHelp)
         }
 
         CWalletTx& wtxIn = pwalletMain->mapWallet[wtxInHash];
-        string strError = SendMoneyWithInputTx(scriptPubKey, MIN_AMOUNT, 0, wtxIn, wtx, false);
+
+        vector< pair<CScript, int64> > vecSend;
+        vecSend.push_back(make_pair(scriptPubKey, MIN_AMOUNT));
+       
+        if (isEmail)
+        {
+            CScript scriptProof;
+            if (!CreateEmailProofScript(vchProof, vchEmail, wtxInHash, scriptProof))
+                throw runtime_error("could not create proof script");
+            
+            vecSend.push_back(make_pair(scriptProof, MIN_AMOUNT));
+        }
+        
+        string strError = SendMoneyWithInputTx(vecSend, 0, wtxIn, wtx, false);
         if (strError != "")
             throw JSONRPCError(RPC_WALLET_ERROR, strError);
     }
@@ -1674,6 +1810,7 @@ CHooks* InitHook()
     mapCallTable.insert(make_pair("name_clean", &name_clean));
     mapCallTable.insert(make_pair("sendtoname", &sendtoname));
     mapCallTable.insert(make_pair("deletetransaction", &deletetransaction));
+    mapCallTable.insert(make_pair("getemailproofbody", &get_email_proof_body));
     hashGenesisBlock = hashNameCoinGenesisBlock;
     printf("Setup namecoin genesis block %s\n", hashGenesisBlock.GetHex().c_str());
     return new CNamecoinHooks();
@@ -1727,9 +1864,102 @@ bool DecodeNameScript(const CScript& script, int& op, vector<vector<unsigned cha
     return error("invalid number of arguments for name op");
 }
 
-bool DecodeNameTx(const CTransaction& tx, int& op, int& nOut, vector<vector<unsigned char> >& vvch, int nHeight)
+const unsigned int SPLIT_DATA_SIZE = 512;
+
+bool WriteSplitData(CScript& script, const vector<unsigned char> &vch)
 {
-    bool found = false;
+    // Split data: [num_blocks] [512] [512] ... [n]
+    if (vch.size() == 0)
+        return false;
+    
+    unsigned int num_blocks = ((vch.size() - 1) / SPLIT_DATA_SIZE) + 1;
+    script << num_blocks;    
+
+    vector<unsigned char> vchData(SPLIT_DATA_SIZE);
+    
+    vector<unsigned char>::const_iterator vchIter = vch.begin();
+    unsigned int bytes_remaining = vch.size();
+
+    while (bytes_remaining) {
+        vector<unsigned char>::const_iterator vchIterNext = vchIter + min(bytes_remaining, SPLIT_DATA_SIZE);
+        vchData.assign(vchIter, vchIterNext);
+        script << vchData;
+        
+        vchIter = vchIterNext;
+        bytes_remaining -= (vchIterNext - vchIter);
+    }
+
+    return true;
+}
+
+bool ReadSplitData(const CScript& script, vector<unsigned char> &vch, CScript::const_iterator &pc)
+{
+    opcodetype opcode;
+    vector<unsigned char> vchBuf;
+    unsigned char opCount;
+    if (!script.GetOp(pc, opcode, vchBuf))
+        return false;
+    
+    if (opcode >= OP_1 && opcode <= OP_16) {
+        opCount = (opcode - OP_1) + 1;
+    } else if (opcode == 1) {
+        opCount = vchBuf[0];
+        if (opCount == 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    vch.clear();
+    vch.reserve(opCount * SPLIT_DATA_SIZE);
+
+    while (opCount--) {
+        if (!script.GetOp(pc, opcode, vchBuf))
+            return false;
+        vch.insert(vch.end(), vchBuf.begin(), vchBuf.end());
+    }
+
+    return true;
+}
+
+bool DecodeProofScript(const CScript& script, int& op, vector<vector<unsigned char> > &vvch)
+{
+    CScript::const_iterator pc = script.begin();
+    opcodetype opcode;
+
+    // Proof script:
+    // OP_RETURN OP_VERIFY OP_PROOF_* [args as split data]
+    
+    if (!script.GetOp(pc, opcode))
+        return false;
+    if (opcode != OP_RETURN)
+        return false;
+
+    if (!script.GetOp(pc, opcode))
+        return false;
+    if (opcode != OP_VERIFY)
+        return false;
+
+    if (!script.GetOp(pc, opcode))
+        return false;
+    op = opcode;
+
+    vvch.clear();
+    vector<unsigned char> vch;
+    while (pc != script.end()) {
+        if (!ReadSplitData(script, vch, pc))
+            return false;
+        vvch.push_back(vch);
+    }
+
+    return true;
+}
+
+bool DecodeNameTx(const CTransaction& tx, int& op, int& nOut, vector<vector<unsigned char> >& vvch, int nHeight,
+        int *proofOp, int *nProofOut, vector<vector<unsigned char> > *vvchProofArgs)
+{
+    bool found = false, found_proof = false;
 
     if (nHeight < 0)
     {
@@ -1764,16 +1994,40 @@ bool DecodeNameTx(const CTransaction& tx, int& op, int& nOut, vector<vector<unsi
                 if (found)
                 {
                     vvch.clear();
+                    if (vvchProofArgs)
+                        vvchProofArgs->clear();
                     return false;
                 }
                 nOut = i;
                 found = true;
                 vvch = vvchRead;
             }
+            else if (proofOp && DecodeProofScript(out.scriptPubKey, *proofOp, vvchRead))
+            {
+                if (found_proof)
+                {
+                    vvch.clear();
+                    if (vvchProofArgs)
+                        vvchProofArgs->clear();
+                    return false;
+                }
+                found_proof = true;
+                if (vvchProofArgs)
+                    *vvchProofArgs = vvchRead;
+                if (nProofOut)
+                    *nProofOut = i;
+            }
         }
 
         if (!found)
             vvch.clear();
+
+        if (!found_proof) {
+            if (vvchProofArgs)
+                vvchProofArgs->clear();
+            if (proofOp)
+                *proofOp = 0;
+        }
     }
     else
     {
@@ -2015,6 +2269,7 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
 {
     int nInput;
     bool found = false;
+    bool found_proof = false;
 
     int prevOp;
     vector<vector<unsigned char> > vvchPrevArgs;
@@ -2073,11 +2328,11 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
         return true;
     }
 
-    vector<vector<unsigned char> > vvchArgs;
-    int op;
-    int nOut;
+    vector<vector<unsigned char> > vvchArgs, vvchProofArgs;
+    int op, proofOp;
+    int nOut, nProofOut;
 
-    bool good = DecodeNameTx(tx, op, nOut, vvchArgs, pindexBlock->nHeight);
+    bool good = DecodeNameTx(tx, op, nOut, vvchArgs, pindexBlock->nHeight, &proofOp, &nProofOut, &vvchProofArgs);
     if (!good)
         return error("ConnectInputsHook() : could not decode a namecoin tx");
 
@@ -2092,6 +2347,9 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
     // and cannot apply the right set of rules
     if (vvchArgs[0].size() > MAX_NAME_LENGTH)
         return error("name transaction with name too long");
+
+    bool needsEmailProof = false;
+    vector<unsigned char> vchEmailAddr;
 
     switch (op)
     {
@@ -2113,20 +2371,24 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
             if (!found || prevOp != OP_NAME_NEW)
                 return error("ConnectInputsHook() : name_firstupdate tx without previous name_new tx");
                 
-            // HACK: The following two checks are redundant after hard-fork at block 150000, because it is performed
-            // in CheckTransaction. However, before that, we do not know height during CheckTransaction
-            // and cannot apply the right set of rules
-            if (vvchArgs[1].size() > 20)
-                return error("name_firstupdate tx with rand too big");
-            if (vvchArgs[2].size() > MAX_VALUE_LENGTH)
-                return error("name_firstupdate tx with value too long");
 
             {
+                // Check if this is an email-verification ("e/") transaction.
+                // If so, we need to also have an email proof output on this transaction.
+                needsEmailProof = DecodeEmailNamespace(vvchArgs[2], &vchEmailAddr);
+                
+                // HACK: The following two checks are redundant after hard-fork at block 150000, because it is performed
+                // in CheckTransaction. However, before that, we do not know height during CheckTransaction
+                // and cannot apply the right set of rules
+                if (vvchArgs[1].size() > 20)
+                    return error("name_firstupdate tx with rand too big");
+                if (vvchArgs[2].size() > MAX_VALUE_LENGTH)
+                    return error("name_firstupdate tx with value too long");
+                
                 // Check hash
                 const vector<unsigned char> &vchHash = vvchPrevArgs[0];
                 const vector<unsigned char> &vchName = vvchArgs[0];
-                const vector<unsigned char> &vchRand = vvchArgs[1];
-                vector<unsigned char> vchToHash(vchRand);
+                vector<unsigned char> vchToHash = vvchArgs[1];
                 vchToHash.insert(vchToHash.end(), vchName.begin(), vchName.end());
                 uint160 hash = Hash160(vchToHash);
                 if (uint160(vchHash) != hash)
@@ -2181,7 +2443,7 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
             // and cannot apply the right set of rules
             if (vvchArgs[1].size() > MAX_VALUE_LENGTH)
                 return error("name_update tx with value too long");
-
+            
             // Check name
             if (vvchPrevArgs[0] != vvchArgs[0])
             {
@@ -2194,6 +2456,9 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
                     fBugWorkaround = true;
                 }
             }
+
+            // Is this an email renewal?
+            needsEmailProof = DecodeEmailNamespace(vvchArgs[0], &vchEmailAddr);
 
             // TODO CPU intensive
             nDepth = CheckTransactionAtRelativeDepth(pindexBlock, vTxindex[nInput], GetExpirationDepth(pindexBlock->nHeight));
@@ -2210,6 +2475,36 @@ bool CNamecoinHooks::ConnectInputs(CTxDB& txdb,
     if (fMiner && fBugWorkaround)
         return error("ConnectInputsHook(): mismatch bug workaround - should not mine this tx");
 
+    // TODO: Limit DKIM proof work from non-miners, and after a given number of confirmations.
+    if (needsEmailProof)
+    {
+        vector<unsigned char> vchPrevTx;
+        if (proofOp == OP_PROOF_EMAIL)
+        {
+            if (vvchProofArgs.size() < 1)
+                return error("Too few args for OP_PROOF_EMAIL");
+
+            if (!ValidateDKIMMessage(vvchProofArgs[0], vchEmailAddr, vchPrevTx))
+                return false;
+
+        }
+        else if (proofOp == OP_PROOF_EMAIL_ZLIB)
+        {
+            // TODO: implement compression
+            return error("OP_PROOF_EMAIL_ZLIB not implemented");
+        }
+        else
+        {
+            return error("Invalid proof type for e/ namespace");
+        }
+
+        if (vTxPrev[nInput].GetHash() != uint256(vchPrevTx))
+        {
+            return error("Email proof does not contain correct prev tx hash");
+        }
+    }
+            
+    
     if (!fBugWorkaround)
     {
         CNameDB dbName("cr+", txdb);
@@ -2364,10 +2659,10 @@ bool CNamecoinHooks::CheckTransaction(const CTransaction& tx)
                     ret[iter] = error("name_new tx with incorrect hash length");
                 break;
             case OP_NAME_FIRSTUPDATE:
-                if (vvch[1].size() > 20)
-                    ret[iter] = error("name_firstupdate tx with rand too big");
                 if (vvch[2].size() > MAX_VALUE_LENGTH)
                     ret[iter] = error("name_firstupdate tx with value too long");
+                if (vvch[1].size() > 20)
+                    ret[iter] = error("name_firstupdate tx with rand too big");
                 break;
             case OP_NAME_UPDATE:
                 if (vvch[1].size() > MAX_VALUE_LENGTH)
@@ -2378,6 +2673,215 @@ bool CNamecoinHooks::CheckTransaction(const CTransaction& tx)
         }
     }
     return ret[0] || ret[1];
+}
+
+bool DecodeEmailNamespace(const vector<unsigned char> &vchName, vector<unsigned char> *email)
+{
+    if (vchName.size() < 2)
+        return false;
+    
+    if (vchName[0] != 'e' || vchName[1] != '/')
+        return false;
+
+    if (email) {
+        email->assign(vchName.begin()+2, vchName.end());
+    }
+
+    return true;
+}
+
+bool CreateEmailProofScript(const vector<unsigned char> &vchMessage, const vector<unsigned char> &email, const uint256 &prevTxHash, CScript &scriptPubKey)
+{
+    vector<unsigned char> vchPrevTx;
+    if (!ValidateDKIMMessage(vchMessage, email, vchPrevTx))
+        return false;
+
+    if (uint256(vchPrevTx) != prevTxHash)
+        return error("Previous TX hash in message does not match last update");
+
+    scriptPubKey.clear();
+
+    scriptPubKey << OP_RETURN << OP_VERIFY << OP_PROOF_EMAIL;
+    WriteSplitData(scriptPubKey, vchMessage);
+
+    return true;
+}
+
+bool ParseEmailMessage(const string &email, multimap<string, string> &headers, string &body_str) {
+    using namespace boost::xpressive;
+    using boost::xpressive::set;
+
+    static sregex WSP = (set= ' ','\t');
+    static sregex CRLF = as_xpr('\r') >> '\n';
+    static sregex FWS = !(*WSP >> CRLF) >> +WSP;
+    static sregex text = set[range('\x01','\x09') | '\x0b' | '\x0c' | range('\x0e','\x7f')];
+    static sregex ftext = set[range('!', '9') | range(';', '~')];
+    static sregex utext = set[range('\x1','\x8') | '\xb' | '\xc' | range('\xe','\x1f') | range('!','\x7f')];
+    static sregex unstructured = *(!FWS >> utext) >> !FWS;
+    static sregex field = (s1=+ftext) >> ':' >> !FWS >> (s2=unstructured) >> CRLF;
+    static sregex body = *(*text >> CRLF) >> *text;
+    static sregex message = +field >> !(CRLF >> (s1=body));
+
+    smatch match;
+    if (!regex_match(email, match, message)) {
+        return false;
+    }
+
+    if (match.size() > 1) {
+        // Found a body
+        body_str = match[1];
+    }
+
+    BOOST_FOREACH(smatch submatch, match.nested_results()) {
+        if (submatch.regex_id() == field.regex_id()) {
+            string header = submatch[1];
+            boost::algorithm::to_lower(header, locale::classic());
+            string value = regex_replace(submatch[2].str(), FWS, " ");
+            headers.insert(make_pair(header, value));
+        }
+    }
+
+    return true;
+}
+
+dkim_lib dkimLib;
+
+const char *VERIFY_ADDR_V1 = "v1";
+const char *VERIFY_ADDR_DOMAIN = "authenticoin.bit";
+    
+bool ValidateDKIMMessage(const vector<unsigned char> &vchMessage, 
+                         const vector<unsigned char> &vchEmail,
+                         vector<unsigned char> &vchPrevTx) {
+    int c;
+    
+    // TODO: add compression support for vchMessage
+    if (!dkimLib)
+        return error("Could not initialize DKIM library");
+   
+    // Parse out headers.
+    multimap<string, string> headers;
+    string body;
+    if (!ParseEmailMessage(stringFromVch(vchMessage), headers, body))
+        return error("Could not parse DKIM message");
+
+    string user, domain;
+    string strEmail = stringFromVch(vchEmail);
+    if (!parse_email_addr(vchEmail, user, domain))
+        return error("Could not parse e/ address '%s'", strEmail.c_str());
+
+    if (strEmail != (user + "@" + domain))
+        return error("Extraneous characters in e/ address '%s'", strEmail.c_str());
+
+    if ((c = headers.count("from")) != 1)
+        return error("Expected 1 From header, found %d", c);
+
+    if ((c = headers.count("to")) != 1)
+        return error("Expected 1 To header, found %d", c);
+
+    if ((c = headers.count("dkim-signature")) != 1)
+        return error("Expected 1 DKIM-Signature header, found %d", c);
+
+    string fromUser, fromDomain;
+    if (!parse_email_addr(vchFromString(headers.find("from")->second), fromUser, fromDomain))
+        return error("Could not parse From header");
+
+    
+    if (domain != fromDomain)
+        return error("Domains in e/ address (%s) and DKIM message (%s) don't match",
+                domain.c_str(), fromDomain.c_str());
+
+    if (user != fromUser)
+        return error("Users in e/ address (%s@%s) and DKIM message (%s@%s) don't match",
+                user.c_str(), domain.c_str(), fromUser.c_str(), fromDomain.c_str());
+
+    string toUser, toDomain;
+    if (!parse_email_addr(vchFromString(headers.find("to")->second), toUser, toDomain))
+        return error("Could not parse To header");
+
+    if (toDomain != VERIFY_ADDR_DOMAIN)
+        return error("Message not to Authenticoin address (unknown domain %s)", toDomain.c_str());
+
+    if (toUser != VERIFY_ADDR_V1)
+        return error("Unknown Authenticoin version '%s'", toUser.c_str());
+
+
+    // We know at this point that the DKIM message purports to be from the claimed e/ address.
+    // Now, we need to verify DKIM signatures to prove it.
+    
+    dkim_stat stat;
+    dkim_context dkim;
+
+    // Initialize the verification context.
+    if ((stat = dkimLib.verify(strEmail.c_str(), dkim)))
+        return error("Could not create DKIM verification context: %s", stat.message());
+
+    // Feed the library our entire message.
+    if ((stat = dkim.chunk(&vchMessage.front(), vchMessage.size())))
+        return error("Could not parse DKIM message: %s", stat.message());
+
+    // Close out the message and validate signatures.
+    if ((stat = dkim.eom()))
+        return error("Could not validate DKIM message: %s", stat.message());
+
+    dkim_siginfo sig = dkim.get_signature();
+    
+    if (!sig.is_header_signed("from"))
+        return error("From header not signed");
+
+    if (!sig.is_header_signed("to"))
+        return error("To header not signed");
+    
+    if ((stat = sig.is_body_fully_signed()))
+        return error("Body not fully signed: %s", stat.message());
+
+    vector<unsigned char> signing_identity;
+    if ((stat = sig.get_identity(signing_identity)))
+        return error("Could not get signing identity: %s", stat.message());
+
+    string signingUser, signingDomain;
+    if (!parse_email_addr(signing_identity, signingUser, signingDomain))
+        return error("Could not parse signing identity");
+
+    if (domain != signingDomain)
+        return error("DKIM message signed by '%s' instead of '%s'",
+                signingDomain.c_str(), domain.c_str());
+
+    if (signingUser != "" && signingUser != user)
+        return error("DKIM message signed to user '%s' instead of '%s'",
+                signingUser.c_str(), user.c_str());
+
+    // Phew! We've proved that the person trying to register e/<email> 
+    // can send mail from <email>.
+    // 
+    // Now, we need to parse out the body of the message to get the nonce.
+    
+    Value valBody;
+    if (!read_string(body, valBody))
+        return error("Could not parse JSON message body");
+
+    if (valBody.type() != obj_type)
+        return error("Malformed JSON message body");
+
+    Value valPrev = find_value(valBody.get_obj(), "prev");
+
+    if (valPrev.type() == null_type)
+        return error("Missing previous TX hash in message body");
+    
+    if (valPrev.type() != str_type)
+        return error("Previous TX hash has wrong type");
+
+    string strPrev = valPrev.get_str();
+
+    if (strPrev.length() != 44)
+        return error("Previous TX hash has wrong length");
+    
+    bool isPrevInvalid = false;
+    vchPrevTx = DecodeBase64(strPrev.c_str(), &isPrevInvalid);
+
+    if (isPrevInvalid || vchPrevTx.size() != 32)
+        return error("Previous TX hash is not valid Base64");
+    
+    return true;
 }
 
 static string nameFromOp(int op)

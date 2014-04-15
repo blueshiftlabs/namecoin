@@ -57,13 +57,16 @@ public:
 static const int NAMECOIN_TX_VERSION = 0x7100;
 static const int64 MIN_AMOUNT = CENT;
 static const int MAX_NAME_LENGTH = 255;
-static const int MAX_VALUE_LENGTH = 1023;
+static const int MAX_VALUE_LENGTH = 520;
 static const int OP_NAME_INVALID = 0x00;
 static const int OP_NAME_NEW = 0x01;
 static const int OP_NAME_FIRSTUPDATE = 0x02;
 static const int OP_NAME_UPDATE = 0x03;
 static const int OP_NAME_NOP = 0x04;
 static const int MIN_FIRSTUPDATE_DEPTH = 12;
+
+static const int OP_PROOF_EMAIL = 0x01;
+static const int OP_PROOF_EMAIL_ZLIB = 0x02;
 
 class CNameIndex;
 class CDiskTxPos;
@@ -84,7 +87,7 @@ bool GetValueOfTxPos(const CDiskTxPos& txPos, std::vector<unsigned char>& vchVal
 int GetDisplayExpirationDepth(int nHeight);
 bool GetNameOfTx(const CTransaction& tx, std::vector<unsigned char>& name);
 bool GetValueOfNameTx(const CTransaction& tx, std::vector<unsigned char>& value);
-bool DecodeNameTx(const CTransaction& tx, int& op, int& nOut, std::vector<std::vector<unsigned char> >& vvch, int nHeight);
+bool DecodeNameTx(const CTransaction& tx, int& op, int& nOut, std::vector<std::vector<unsigned char> >& vvch, int nHeight, int *proofOp = NULL, int *nProofOut = NULL, std::vector<std::vector<unsigned char> > *vvchProofArgs = NULL);
 bool DecodeNameScript(const CScript& script, int& op, std::vector<std::vector<unsigned char> > &vvch);
 bool GetNameAddress(const CTransaction& tx, std::string& strAddress);
 std::string SendMoneyWithInputTx(CScript scriptPubKey, int64 nValue, int64 nNetFee, CWalletTx& wtxIn, CWalletTx& wtxNew, bool fAskFee);

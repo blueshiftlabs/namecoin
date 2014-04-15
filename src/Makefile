@@ -22,7 +22,6 @@ LIBS= \
    -l db_cxx-4.8 \
    -l ssl \
    -l crypto \
-   -l krb5 \
    -l opendkim
 
 namecoin: USE_UPNP:=1
@@ -82,6 +81,7 @@ OBJS= \
     obj/main.o \
     obj/wallet.o \
     obj/bitcoinrpc.o \
+    obj/dkimwrap.o \
     obj/init.o \
     cryptopp/obj/sha.o \
     cryptopp/obj/cpu.o
