@@ -1,0 +1,10 @@
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=blueshiftlabs.net; s=dkim; h=mime-version:date:message-id:subject:from:to:content-type; bh=kcKFUXC38vr3DTs7budy/hWzjitOfSayWcil80nZ8+c=; b=H5E63IvI+Q5KbV6fZbN9AJRmogZZ5ddRB5Z9vKdxRJGcOCzefAKm8F0Rwigr6REdMC bwDXqDhhFAE35ZkwnmQnIZpX6eAVyBvJo2bhl3DfwZIW2bEcip9p5PHMzTGlbXz8Efim /yOAvPj6/5e1iT/mjo0SMtBfviRrzPvuh03AM=
+MIME-Version: 1.0
+Date: Mon, 14 Apr 2014 21:31:16 -0400
+Message-ID: <CAMJTOk0OZibVyXuYiNQmB6HrNm0XFiZMd-PL7h-wW6fXRzTXJw@mail.gmail.com>
+Subject:
+From: SpamTrap Service <devnull@blueshiftlabs.net>
+To: v1@authenticoin.bit
+Content-Type: text/plain; charset=UTF-8
+
+{"prev":"pZuB/Z8i9a5jzG/y2j85b+atoF27gvdPXC92xkdRitY="}
